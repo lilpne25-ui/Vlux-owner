@@ -1,3 +1,4 @@
+import hmac
 import json
 
 from odoo import http
@@ -12,6 +13,16 @@ class VluxOwnerController(http.Controller):
         if not request.env.user.has_group("vlux_owner.group_vlux_owner"):
             raise AccessError("Tu usuario no tiene acceso a VLUX Owner.")
 
+    def _json_response(self, payload, status=200):
+        response = Response(
+            json.dumps(payload, ensure_ascii=False),
+            status=status,
+            content_type="application/json; charset=utf-8",
+        )
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        return response
+
     @http.route("/vlux-owner", type="http", auth="user", methods=["GET"], sitemap=False)
     def owner_redirect(self, **kwargs):
         return request.redirect("/vlux-owner/")
@@ -25,6 +36,50 @@ class VluxOwnerController(http.Controller):
     def dashboard(self, date=None, **kwargs):
         self._ensure_owner_access()
         return request.env["vlux.owner.dashboard.service"].get_dashboard(date=date)
+
+    @http.route(
+        "/vlux_owner/api/share/dashboard",
+        type="http",
+        auth="public",
+        methods=["POST"],
+        csrf=False,
+        save_session=False,
+        sitemap=False,
+    )
+    def shared_dashboard(self, **kwargs):
+        """Read-only dashboard bridge for trusted server-to-server demo access.
+
+        The secret is stored only in Odoo and in the Vercel server environment.
+        It is never embedded in the browser application.
+        """
+        params = request.env["ir.config_parameter"].sudo()
+        expected_token = params.get_param("vlux_owner.demo_api_token", "")
+        provided_token = request.httprequest.headers.get("X-VLUX-Owner-Token", "")
+
+        if not expected_token or not provided_token or not hmac.compare_digest(expected_token, provided_token):
+            return self._json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+        try:
+            payload = request.httprequest.get_json(silent=True) or {}
+            requested_date = payload.get("date")
+
+            user_id = int(params.get_param("vlux_owner.demo_user_id", "2") or 2)
+            demo_user = request.env["res.users"].sudo().browse(user_id).exists()
+            if not demo_user or not demo_user.active:
+                return self._json_response({"ok": False, "error": "demo_user_unavailable"}, status=503)
+
+            service = (
+                request.env["vlux.owner.dashboard.service"]
+                .with_user(demo_user)
+                .with_company(demo_user.company_id)
+            )
+            data = service.get_dashboard(date=requested_date)
+            return self._json_response({"ok": True, "data": data})
+        except (TypeError, ValueError):
+            return self._json_response({"ok": False, "error": "invalid_request"}, status=400)
+        except Exception:
+            request.env.cr.rollback()
+            return self._json_response({"ok": False, "error": "dashboard_unavailable"}, status=503)
 
     @http.route("/vlux-owner/manifest.webmanifest", type="http", auth="public", methods=["GET"], sitemap=False)
     def manifest(self, **kwargs):
